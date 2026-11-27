@@ -8631,6 +8631,7 @@ impl Host {
                     plane,
                     plane_format,
                 );
+                crate::triangle::record(self, list, &back, (width, height, format));
                 let mut barriers = vec![transition(
                     &back,
                     D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -8646,9 +8647,15 @@ impl Host {
                     transition(
                         &back,
                         D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
                     ),
                 ]);
+                crate::triangle::record(self, list, &back, (width, height, format));
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
             }
             let _ = drawn;
             copy.close();
