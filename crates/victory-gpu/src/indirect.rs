@@ -274,7 +274,7 @@ fn dxc_factory() -> windows::core::Result<DxcCreateInstanceFn> {
 }
 
 /// Compile HLSL with DXC and return DXIL. There is deliberately no FXC fallback.
-fn compile_hlsl(source: &str, entry: &str, profile: &str) -> windows::core::Result<Vec<u8>> {
+pub(crate) fn compile_hlsl(source: &str, entry: &str, profile: &str) -> windows::core::Result<Vec<u8>> {
     DXC.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
