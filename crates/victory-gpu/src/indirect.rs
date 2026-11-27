@@ -114,7 +114,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
-        running_budget = budget.Load(0);
+        // RWByteAddressBuffer has no Load method in DXC. Read the word with
+        // an atomic compare-exchange that writes the same value back.
+        uint initial_budget;
+        budget.InterlockedCompareExchange(0, 0, 0, initial_budget);
+        running_budget = initial_budget;
     }
     GroupMemoryBarrierWithGroupSync();
     if (active && kind <= 1) {
@@ -194,8 +198,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         budget.Store(0, running_budget);
         if (kind > 2) {
-            budget.Store(4, max(budget.Load(4), largest_asked));
-            budget.Store(8, budget.Load(8) + all_asked);
+            // These counters can be updated by more than one clamp group.
+            budget.InterlockedMax(4, largest_asked);
+            budget.InterlockedAdd(8, all_asked);
         }
     }
     GroupMemoryBarrierWithGroupSync();
