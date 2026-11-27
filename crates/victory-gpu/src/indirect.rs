@@ -430,7 +430,7 @@ fn clamp_into(
     ahead: bool,
 ) -> Result<(), &'static str> {
     let before = list.indirect_state(dst);
-    record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead)?;
+    record_clamp_as_detailed(c, &list.list, (dst, before), budget, src, count, spec, ahead)?;
     list.indirect_readable(dst);
     Ok(())
 }
@@ -442,6 +442,21 @@ fn clamp_into(
 /// layout or the addresses do not fit the clamp.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_as_detailed(c, l, (dst, before), budget, src, count, spec, ahead).is_ok()
+}
+
+/// Records the clamp and returns a stable reason if its inputs cannot be used.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_as_detailed(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
