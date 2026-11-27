@@ -1459,6 +1459,7 @@ void main() {
             Err("indirect argument range exceeds 32-bit clamp limit")
         );
     }
+
     #[test]
     fn rejects_unaligned_or_undersized_layouts() {
         assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
