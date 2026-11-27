@@ -29,10 +29,20 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use std::cell::RefCell;
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::sync::OnceLock;
+
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::Dxc::{
+    CLSID_DxcCompiler, CLSID_DxcUtils, DXC_CP_UTF8, IDxcBlob, IDxcCompiler3,
+    IDxcIncludeHandler, IDxcResult, IDxcUtils, DxcBuffer,
+};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::core::{s, Error, GUID, HRESULT, Interface, PCWSTR};
 
 use crate::host::{HostList, host, transition};
 
@@ -212,6 +222,117 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 }
 "#;
 
+type DxcCreateInstanceFn = unsafe extern "system" fn(
+    rclsid: *const GUID,
+    riid: *const GUID,
+    object: *mut *mut std::ffi::c_void,
+) -> HRESULT;
+
+static DXC_MODULE: OnceLock<usize> = OnceLock::new();
+
+thread_local! {
+    static DXC: RefCell<Option<(IDxcCompiler3, IDxcIncludeHandler)>> =
+        const { RefCell::new(None) };
+}
+
+fn dxc_create_instance<T: Interface>(
+    create: DxcCreateInstanceFn,
+    class: &GUID,
+) -> windows::core::Result<T> {
+    let mut object = std::ptr::null_mut();
+    // SAFETY: DXC's factory writes an interface pointer matching T::IID.
+    unsafe {
+        create(class, &T::IID, &mut object).ok()?;
+        if object.is_null() {
+            return Err(Error::empty());
+        }
+        Ok(T::from_raw(object))
+    }
+}
+
+fn dxc_factory() -> windows::core::Result<DxcCreateInstanceFn> {
+    let module = *DXC_MODULE.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_DXC_PATH")
+            .unwrap_or_else(|| OsStr::new("dxcompiler.dll").to_os_string());
+        let wide: Vec<u16> = path.encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: the nul-terminated path remains alive for the call.
+        unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())).map(|module| module.0 as usize).unwrap_or(0) }
+    });
+    if module == 0 {
+        return Err(Error::new(
+            HRESULT(0x8007_007e_u32 as i32),
+            "DXC unavailable: could not load dxcompiler.dll (set VICTORY_DXC_PATH)",
+        ));
+    }
+    // SAFETY: the module handle is pinned for the process lifetime.
+    let symbol = unsafe {
+        GetProcAddress(HMODULE(module as *mut _), s!("DxcCreateInstance"))
+    }
+    .ok_or_else(Error::from_win32)?;
+    // SAFETY: this export has the documented DxcCreateInstance ABI.
+    Ok(unsafe { std::mem::transmute(symbol) })
+}
+
+/// Compile HLSL with DXC and return DXIL. There is deliberately no FXC fallback.
+fn compile_hlsl(source: &str, entry: &str, profile: &str) -> windows::core::Result<Vec<u8>> {
+    DXC.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let create = dxc_factory()?;
+            let compiler: IDxcCompiler3 = dxc_create_instance(create, &CLSID_DxcCompiler)?;
+            let utils: IDxcUtils = dxc_create_instance(create, &CLSID_DxcUtils)?;
+            // SAFETY: the returned include handler is owned by its COM wrapper.
+            let include = unsafe { utils.CreateDefaultIncludeHandler()? };
+            *slot = Some((compiler, include));
+            tracing::info!("DXC compiler initialized through dxcompiler.dll");
+        }
+
+        let (compiler, include) = slot.as_ref().expect("DXC initialized above");
+        let arguments = ["-E", entry, "-T", profile, "-O3"];
+        let wide_arguments: Vec<Vec<u16>> = arguments
+            .iter()
+            .map(|arg| arg.encode_utf16().chain(std::iter::once(0)).collect())
+            .collect();
+        let argument_pointers: Vec<PCWSTR> = wide_arguments
+            .iter()
+            .map(|arg| PCWSTR(arg.as_ptr()))
+            .collect();
+        let buffer = DxcBuffer {
+            Ptr: source.as_ptr().cast(),
+            Size: source.len(),
+            Encoding: DXC_CP_UTF8.0,
+        };
+
+        // SAFETY: source and argument buffers remain alive for the compile call.
+        let result: IDxcResult = unsafe {
+            compiler.Compile::<_, IDxcResult>(&buffer, Some(&argument_pointers), include)?
+        };
+
+        if let Ok(error_blob) = unsafe { result.GetErrorBuffer() } {
+            let blob: IDxcBlob = error_blob.into();
+            let size = unsafe { blob.GetBufferSize() };
+            if size != 0 {
+                let pointer = unsafe { blob.GetBufferPointer() };
+                if !pointer.is_null() {
+                    let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) };
+                    tracing::warn!("DXC diagnostics: {}", String::from_utf8_lossy(bytes));
+                }
+            }
+        }
+
+        let status = unsafe { result.GetStatus()? };
+        status.ok()?;
+        let code = unsafe { result.GetResult()? };
+        let size = unsafe { code.GetBufferSize() };
+        let pointer = unsafe { code.GetBufferPointer() };
+        if pointer.is_null() || size == 0 {
+            return Err(Error::empty());
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) };
+        Ok(bytes.to_vec())
+    })
+}
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -247,51 +368,15 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // Build the root signature independently from the shader bytecode. This
-    // avoids relying on FXC's embedded-root-signature extraction path and
-    // makes the binding contract explicit at the D3D12 boundary.
+    let code = compile_hlsl(source, "main", "cs_6_0")?;
     let root = make_root_signature(device)?;
-    // SAFETY: the blob owns the bytecode for the duration of pipeline creation.
+    // SAFETY: the owned DXIL byte vector remains alive through PSO creation.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
             },
             ..Default::default()
         })?;
@@ -1297,33 +1382,15 @@ void main() {
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
+        let code = compile_hlsl(source, "main", "cs_6_0")?;
+        // SAFETY: the DXIL byte vector remains alive through both D3D12 calls.
         unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
             let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
                 },
                 ..Default::default()
             })?;
