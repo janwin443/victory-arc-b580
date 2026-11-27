@@ -308,21 +308,41 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
-/// Validates record alignment and returns the scratch byte size `stride * records`.
+/// Validates record layout and returns the scratch byte size `stride * records`.
 fn validate_layout(
-    (kind, stride, records): (u32, u32, u32),
+    spec: (u32, u32, u32),
     src_offset: u64,
     count_offset: Option<u64>,
 ) -> Option<u64> {
-    let min = min_stride(kind)?;
-    if stride < min || !stride.is_multiple_of(4) || !src_offset.is_multiple_of(4) {
-        return None;
+    validate_layout_detailed(spec, src_offset, count_offset).ok()
+}
+
+/// As `validate_layout`, retaining a stable category for diagnostics.
+fn validate_layout_detailed(
+    (kind, stride, records): (u32, u32, u32),
+    src_offset: u64,
+    count_offset: Option<u64>,
+) -> Result<u64, &'static str> {
+    let min = min_stride(kind).ok_or("unsupported indirect argument kind")?;
+    if stride < min {
+        return Err("indirect argument stride is below minimum");
+    }
+    if !stride.is_multiple_of(4) {
+        return Err("indirect argument stride is not 4-byte aligned");
+    }
+    if !src_offset.is_multiple_of(4) {
+        return Err("indirect argument offset is not 4-byte aligned");
     }
     if count_offset.is_some_and(|off| !off.is_multiple_of(4)) {
-        return None;
+        return Err("indirect count offset is not 4-byte aligned");
     }
-    let bytes = u64::from(stride).checked_mul(u64::from(records))?;
-    (bytes <= u64::from(u32::MAX)).then_some(bytes)
+    let bytes = u64::from(stride)
+        .checked_mul(u64::from(records))
+        .ok_or("indirect argument byte size overflow")?;
+    if bytes > u64::from(u32::MAX) {
+        return Err("indirect argument range exceeds 32-bit clamp limit");
+    }
+    Ok(bytes)
 }
 
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
@@ -351,8 +371,7 @@ pub(crate) fn bound_detailed(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Result<ID3D12Resource, &'static str> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))
-        .ok_or("invalid indirect argument layout or 4-byte alignment")?;
+    let bytes = validate_layout_detailed(spec, src.1, count.map(|(_, off)| off))?;
     let c = clamp().ok_or("argument clamp pipeline unavailable")?;
     let budget = list.budget().ok_or("indirect budget buffer unavailable")?;
     let dst = list
@@ -386,8 +405,7 @@ pub(crate) fn bound_ahead_detailed(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Result<ID3D12Resource, &'static str> {
-    let bytes =
-        validate_layout(spec, src.1, None).ok_or("invalid indirect argument layout or 4-byte alignment")?;
+    let bytes = validate_layout_detailed(spec, src.1, None)?;
     let c = clamp().ok_or("argument clamp pipeline unavailable")?;
     let budget = list.budget().ok_or("indirect budget buffer unavailable")?;
     let dst = list
@@ -433,12 +451,11 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> Result<(), &'static str> {
-    let bytes = validate_layout(
+    let bytes = validate_layout_detailed(
         (kind, stride, records),
         src_offset,
         count.map(|(_, off)| off),
-    )
-    .ok_or("invalid indirect argument layout or 4-byte alignment")?;
+    )?;
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
@@ -1415,6 +1432,33 @@ void main() {
         assert!(super::clamp().is_some());
     }
 
+    #[test]
+    fn reports_why_indirect_layouts_are_rejected() {
+        assert_eq!(
+            validate_layout_detailed((7, 16, 1), 0, None),
+            Err("unsupported indirect argument kind")
+        );
+        assert_eq!(
+            validate_layout_detailed((10, 8, 1), 0, None),
+            Err("indirect argument stride is below minimum")
+        );
+        assert_eq!(
+            validate_layout_detailed((10, 13, 1), 0, None),
+            Err("indirect argument stride is not 4-byte aligned")
+        );
+        assert_eq!(
+            validate_layout_detailed((10, 12, 1), 2, None),
+            Err("indirect argument offset is not 4-byte aligned")
+        );
+        assert_eq!(
+            validate_layout_detailed((2, 12, 1), 0, Some(2)),
+            Err("indirect count offset is not 4-byte aligned")
+        );
+        assert_eq!(
+            validate_layout_detailed((1, 20, u32::MAX), 0, None),
+            Err("indirect argument range exceeds 32-bit clamp limit")
+        );
+    }
     #[test]
     fn rejects_unaligned_or_undersized_layouts() {
         assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
