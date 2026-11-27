@@ -133,9 +133,8 @@ fn table(ranges: &[D3D12_DESCRIPTOR_RANGE], visibility: D3D12_SHADER_VISIBILITY)
 }
 
 fn make(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pass> {
-    use windows::core::s;
-    let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1"))?;
-    let ps = crate::host::compile(SOURCE, s!("over"), s!("ps_5_1"))?;
+    let vs = crate::host::compile(SOURCE, "corner", "vs_6_0")?;
+    let ps = crate::host::compile(SOURCE, "over", "ps_6_0")?;
     let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
         pShaderBytecode: bytes.as_ptr().cast(),
         BytecodeLength: bytes.len(),
@@ -360,7 +359,7 @@ const STRETCH_RING: u32 = 64;
 
 fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
     use windows::core::s;
-    let cs = crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1"))?;
+    let cs = crate::host::compile(STRETCH, "stretch", "cs_6_0")?;
     let views = [
         range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0),
         range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1),
