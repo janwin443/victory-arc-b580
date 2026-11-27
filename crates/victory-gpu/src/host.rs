@@ -1169,7 +1169,6 @@ impl PlanePass {
     }
 
     fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
-        use windows::core::s;
         let device = &host().ok_or_else(windows::core::Error::empty)?.device;
         let vs = compile(PLANE_CORNERS, "corner", "vs_6_0")?;
         let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
@@ -1178,8 +1177,8 @@ impl PlanePass {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
-        // description points at live data and never releases its pointer.
+        // SAFETY: the root signature and both DXIL byte vectors stay alive
+        // through pipeline creation.
         unsafe {
             let root = plane_root_signature(device)?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
