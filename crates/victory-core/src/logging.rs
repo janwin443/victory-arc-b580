@@ -86,6 +86,12 @@ impl LineWriter {
     }
 }
 
+impl Drop for LineWriter {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 impl Write for LineWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.pending.extend_from_slice(bytes);
