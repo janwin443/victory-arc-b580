@@ -171,8 +171,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (active && cost > 0) {
                 uint before = running_budget;
-                over = before >= BUDGET || (BUDGET - before) < cost;
-                if (!over) {
+                if (before >= BUDGET) {
+                    over = true;
+                } else if ((BUDGET - before) < cost) {
+                    over = true;
+                    running_budget = BUDGET;
+                } else {
                     running_budget = before + cost;
                 }
             }
