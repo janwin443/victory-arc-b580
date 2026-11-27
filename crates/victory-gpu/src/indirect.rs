@@ -451,7 +451,7 @@ fn record_clamp_as(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_as_detailed(c, l, (dst, before), budget, src, count, spec, ahead).is_ok()
+    record_clamp_as_detailed(c, l, (dst, before), budget, (src, src_offset), count, spec, ahead).is_ok()
 }
 
 /// Records the clamp and returns a stable reason if its inputs cannot be used.
