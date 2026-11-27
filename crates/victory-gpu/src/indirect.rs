@@ -174,7 +174,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     bool over = false;
     if (active && cost > 0) {
         uint before;
-        budget.InterlockedOr(0, 0, before);
+        budget.InterlockedCompareExchange(0, 0, 0, before);
         [allow_uav_condition]
         while (before < BUDGET) {
             uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
