@@ -118,7 +118,7 @@ pub(crate) fn record(
     // SAFETY: the back buffer is in RENDER_TARGET state and the command list
     // is open. The cached pipeline and root signature outlive this recording.
     unsafe {
-        list.OMSetRenderTargets(1, Some(&target), false, None);
+        list.OMSetRenderTargets(1, Some(target.as_ptr()), false, None);
         list.SetGraphicsRootSignature(&triangle.root);
         list.SetPipelineState(&triangle.pipeline);
         list.RSSetViewports(&[D3D12_VIEWPORT {
