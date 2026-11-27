@@ -268,7 +268,7 @@ fn dxc_factory() -> windows::core::Result<DxcCreateInstanceFn> {
     let symbol = unsafe {
         GetProcAddress(HMODULE(module as *mut _), s!("DxcCreateInstance"))
     }
-    .ok_or_else(Error::from_win32)?;
+    .ok_or_else(|| Error::new(HRESULT(0x8000_4005u32 as i32), "GetProcAddress(DxcCreateInstance) failed"))?;
     // SAFETY: this export has the documented DxcCreateInstance ABI.
     Ok(unsafe { std::mem::transmute(symbol) })
 }
