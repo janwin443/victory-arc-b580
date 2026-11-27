@@ -593,11 +593,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 
 fn create() -> windows::core::Result<Host> {
     #[cfg(feature = "vulkan")]
-    if std::env::var_os("VICTORY_VULKAN_PROBE").is_some() {
-        match crate::vulkan::probe() {
-            Ok(()) => tracing::info!("Vulkan probe completed; D3D12 remains the active backend"),
-            Err(error) => tracing::warn!(%error, "Vulkan probe failed; continuing with D3D12"),
-        }
+    match crate::vulkan::probe() {
+        Ok(()) => tracing::info!("Vulkan probe completed; D3D12 remains the active backend"),
+        Err(error) => tracing::warn!(%error, "Vulkan probe failed; continuing with D3D12"),
     }
     crate::drvwatch::start();
     crate::spread::start();
