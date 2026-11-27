@@ -76,6 +76,7 @@ static const uint GROUPS = 1u << 20;
 // which no barrier orders: see the note where the records charge.
 groupshared uint largest_asked;
 groupshared uint all_asked;
+groupshared uint running_budget;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
@@ -105,7 +106,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
+        running_budget = budget.Load(0);
     }
+    GroupMemoryBarrierWithGroupSync();
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 want = src_args.Load2(src_at);
@@ -154,43 +157,36 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         groups = g;
     }
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
-        // Diagnostics, in the budget buffer's next words (below): the
-        // largest group count a mesh record asked for, and the groups
-        // asked in all.
-        uint was;
-        InterlockedMax(largest_asked, asked, was);
-        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
-    }
-    // Every record charges the budget on its own, in lane order within the
-    // group. The caller runs one group per 64 records with a barrier between
-    // them, so the chunks also charge in lane order: without that, the
-    // groups of one dispatch ran in no defined order and the scheduler
-    // decided which records fitted (with 128 records WARP kept the second
-    // chunk's first two and emptied the first chunk's, where lane order
-    // keeps the first chunk's). None of a chunk's records touch the budget
-    // for a chunk past a count buffer's count (an execution may ask for
-    // thousands and count a few).
+    // Atomics on RWByteAddressBuffer are not accepted by every HLSL
+    // compiler used by the D3D12 host. Process the 64 lanes in a fixed
+    // order instead. The caller dispatches one group per 64 records and
+    // inserts a UAV barrier between groups, so a plain Load/Store of the
+    // shared list budget is race-free and preserves deterministic charging.
     bool over = false;
-    if (active && cost > 0) {
-        uint before;
-        budget.InterlockedAdd(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
+    for (uint lane = 0; lane < 64; ++lane) {
+        if (gi == lane) {
+            if (active && kind > 2) {
+                largest_asked = max(largest_asked, asked);
+                all_asked += min(asked, 1u << 24);
+            }
+            if (active && cost > 0) {
+                uint before = running_budget;
+                over = before >= BUDGET || (BUDGET - before) < cost;
+                if (!over) {
+                    running_budget = before + cost;
+                }
+            }
         }
-        over = before >= BUDGET || BUDGET - before < cost;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) {
+        budget.Store(0, running_budget);
+        if (kind > 2) {
+            budget.Store(4, max(budget.Load(4), largest_asked));
+            budget.Store(8, budget.Load(8) + all_asked);
+        }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2) {
-        uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
-    }
     if (!active) {
         return;
     }
