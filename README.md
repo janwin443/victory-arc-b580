@@ -100,7 +100,6 @@ Changes should be evidence-driven. Avoid enabling experimental switches or chang
 
 GitHub Actions runs on pushes to `main` and on pull requests. The workflow checks:
 
-- `cargo fmt --all -- --check`
 - `cargo check --workspace --all-targets --locked`
 - Clippy with the default and all-feature configurations
 - `cargo test --workspace --locked`
