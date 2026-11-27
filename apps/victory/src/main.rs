@@ -21,6 +21,12 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
+    /// Mirror log output to victory.log in the current working directory.
+    #[arg(long, global = true)]
+    log: bool,
+    /// Keep only log lines matching this Rust regular expression.
+    #[arg(long, global = true, value_name = "REGEX")]
+    grep: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -129,13 +135,13 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
     }
     let cli = Cli::parse();
+    victory_core::logging::init("info", cli.log, cli.grep.as_deref())?;
     match cli.command {
         Command::Inspect {
             file,
