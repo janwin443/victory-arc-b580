@@ -339,9 +339,27 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    bound_detailed(list, src, count, spec).ok()
+}
+
+/// As bound, retaining the reason when the clamp cannot be recorded.
+/// The reason is a small static category so callers can aggregate it
+/// instead of emitting one log line for every dropped indirect command.
+pub(crate) fn bound_detailed(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Result<ID3D12Resource, &'static str> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))
+        .ok_or("invalid indirect argument layout or 4-byte alignment")?;
+    let c = clamp().ok_or("argument clamp pipeline unavailable")?;
+    let budget = list.budget().ok_or("indirect budget buffer unavailable")?;
+    let dst = list
+        .indirect_scratch(bytes)
+        .ok_or("indirect scratch buffer allocation failed")?;
+    clamp_into(list, c, &dst, budget, src, count, spec, false)?;
+    Ok(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -359,9 +377,24 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    bound_ahead_detailed(list, src, spec).ok()
+}
+
+/// Like bound_ahead, with a categorized failure reason.
+pub(crate) fn bound_ahead_detailed(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+) -> Result<ID3D12Resource, &'static str> {
+    let bytes =
+        validate_layout(spec, src.1, None).ok_or("invalid indirect argument layout or 4-byte alignment")?;
+    let c = clamp().ok_or("argument clamp pipeline unavailable")?;
+    let budget = list.budget().ok_or("indirect budget buffer unavailable")?;
+    let dst = list
+        .indirect_scratch(bytes)
+        .ok_or("indirect scratch buffer allocation failed")?;
+    clamp_into(list, c, &dst, budget, src, None, spec, true)?;
+    Ok(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -377,13 +410,11 @@ fn clamp_into(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     ahead: bool,
-) -> bool {
+) -> Result<(), &'static str> {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
-    if recorded {
-        list.indirect_readable(dst);
-    }
-    recorded
+    record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead)?;
+    list.indirect_readable(dst);
+    Ok(())
 }
 
 /// Records the clamp into `dst`, which is in state `before` (common, or
@@ -401,18 +432,17 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
-) -> bool {
-    let Some(bytes) = validate_layout(
+) -> Result<(), &'static str> {
+    let bytes = validate_layout(
         (kind, stride, records),
         src_offset,
         count.map(|(_, off)| off),
-    ) else {
-        return false;
-    };
+    )
+    .ok_or("invalid indirect argument layout or 4-byte alignment")?;
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
-        return false;
+        return Err("indirect resource GPU address is not 4-byte aligned");
     }
     let (src_gpu, args_offset) = match src_offset
         .checked_add(bytes)
@@ -421,7 +451,7 @@ fn record_clamp_as(
         Some(_) => (src_base, src_offset as u32),
         None => {
             let Some(rebased) = src_base.checked_add(src_offset) else {
-                return false;
+                return Err("indirect argument GPU address overflow");
             };
             (rebased, 0)
         }
@@ -431,13 +461,13 @@ fn record_clamp_as(
             // SAFETY: a live D3D12 buffer resource.
             let base = unsafe { buf.GetGPUVirtualAddress() };
             if !base.is_multiple_of(4) {
-                return false;
+                return Err("indirect count GPU address is not 4-byte aligned");
             }
             match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
                 Some(_) => (base, 1u32, off as u32),
                 None => {
                     let Some(rebased) = base.checked_add(off) else {
-                        return false;
+                        return Err("indirect count GPU address overflow");
                     };
                     (rebased, 1u32, 0u32)
                 }
@@ -506,7 +536,7 @@ fn record_clamp_as(
         }
         l.ResourceBarrier(&second[skip..]);
     }
-    true
+    Ok(())
 }
 
 /// Whether each clamp waits for every earlier shader write before it and
