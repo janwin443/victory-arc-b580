@@ -1,4 +1,5 @@
-//! D3D12.X on host D3D12.
+//! D3D12.X GPU emulation with selectable host backends. D3D12 is currently
+//! implemented; the Vulkan backend is being brought up alongside it.
 //!
 //! D3D12.X records commands from code inlined into the title, which writes
 //! packets into the command list while its put pointer is below a limit and
@@ -47,6 +48,8 @@ pub mod framelog;
 mod heap_worker;
 #[cfg(windows)]
 mod host;
+#[cfg(all(windows, feature = "vulkan"))]
+mod vulkan;
 #[cfg(windows)]
 mod over;
 #[cfg(windows)]
