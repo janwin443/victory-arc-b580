@@ -4,8 +4,8 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
+//! compute shader of ours (HLSL compiled by the system's compiler as Shader
+//! Model 5.1), leaving the title's argument and
 //! count buffers untouched.
 //!
 //! The scratch buffer is left readable as indirect arguments after a clamp
@@ -37,7 +37,6 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -77,7 +76,6 @@ static const uint GROUPS = 1u << 20;
 groupshared uint largest_asked;
 groupshared uint all_asked;
 groupshared uint running_budget;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
@@ -281,11 +279,14 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // Build the root signature independently from the shader bytecode. This
+    // avoids relying on FXC's embedded-root-signature extraction path and
+    // makes the binding contract explicit at the D3D12 boundary.
+    let root = make_root_signature(device)?;
+    // SAFETY: the blob owns the bytecode for the duration of pipeline creation.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -295,6 +296,101 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
             ..Default::default()
         })?;
         Ok(Clamp { root, pso })
+    }
+}
+
+fn make_root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0, D3D12_ROOT_CONSTANTS,
+        D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV,
+        D3D12_SHADER_VISIBILITY_ALL, D3D12_ROOT_SIGNATURE_DESC,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D_ROOT_SIGNATURE_VERSION_1,
+        D3D12SerializeRootSignature,
+    };
+
+    let parameters = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 7,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: parameters.len() as u32,
+        pParameters: parameters.as_ptr(),
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+
+    let mut serialized: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: descriptor and parameter array stay alive for the serialization call.
+    let result = unsafe {
+        D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &mut serialized,
+            Some(&mut errors),
+        )
+    };
+    if let Err(error) = result {
+        if let Some(errors) = errors {
+            // SAFETY: the error blob owns the bytes returned by D3D12.
+            let text = unsafe {
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
+            };
+            tracing::warn!("argument clamp root signature: {}", String::from_utf8_lossy(text));
+        }
+        return Err(error);
+    }
+
+    let serialized = serialized.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: serialized root-signature bytes remain alive through CreateRootSignature.
+    unsafe {
+        let bytes = std::slice::from_raw_parts(
+            serialized.GetBufferPointer().cast::<u8>(),
+            serialized.GetBufferSize(),
+        );
+        device.CreateRootSignature(0, bytes)
     }
 }
 
