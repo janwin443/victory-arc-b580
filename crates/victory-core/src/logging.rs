@@ -30,8 +30,10 @@ struct Sinks {
 }
 
 impl Sinks {
-    fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
-        self.stderr.write_all(line)?;
+    fn write_line(&mut self, line: &[u8], show_in_terminal: bool) -> io::Result<()> {
+        if show_in_terminal {
+            self.stderr.write_all(line)?;
+        }
         if let Some(file) = &mut self.file {
             file.write_all(line)?;
         }
@@ -73,15 +75,14 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LineMakeWriter {
 
 impl LineWriter {
     fn emit(&mut self, line: &[u8]) -> io::Result<()> {
-        let matches = self.grep.as_ref().is_none_or(|regex| {
-            regex.is_match(&String::from_utf8_lossy(line))
-        });
-        if matches {
-            self.sinks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .write_line(line)?;
-        }
+        let matches = self
+            .grep
+            .as_ref()
+            .is_none_or(|regex| regex.is_match(&String::from_utf8_lossy(line)));
+        self.sinks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .write_line(line, matches)?;
         Ok(())
     }
 }
