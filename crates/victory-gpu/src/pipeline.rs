@@ -311,7 +311,7 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 /// Whether a dispatch with the title's pipeline `this` is held back
 /// because its program walks ray-tracing structures nothing has built
-/// (`VICTORY_BVH_HOLD=1`; off by default).
+/// (`VICTORY_BVH_HOLD=0` disables this; on by default).
 ///
 /// The structure builder does not run (see [`Builder`]: only with
 /// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
@@ -334,7 +334,7 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 #[cfg(windows)]
 pub(crate) fn walk_held(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_none_or(|v| v != "0")) {
         return false;
     }
     let p = pipeline(this);
@@ -350,7 +350,7 @@ pub(crate) fn walk_held(this: This) -> bool {
         ONCE.call_once(|| {
             tracing::info!(
                 shaders = ?p.shaders,
-                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not                  built them (VICTORY_BVH_HOLD=1); the first one"
+                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not                  built them (default; set VICTORY_BVH_HOLD=0 to disable); the first one"
             );
         });
     }

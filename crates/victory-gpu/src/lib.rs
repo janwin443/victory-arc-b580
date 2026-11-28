@@ -94,6 +94,8 @@ mod texture;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod triangle;
 
 #[cfg(windows)]
 pub use host::on_failure;

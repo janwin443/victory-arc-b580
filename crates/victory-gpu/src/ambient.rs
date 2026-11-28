@@ -19,7 +19,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::s;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -221,7 +220,7 @@ unsafe impl Sync for Pass {}
 
 fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
     // The layer's shared compiler, as the indirect clamp uses (and any fallback it gets).
-    let code = crate::host::compile(SOURCE, s!("main"), s!("cs_5_1"))?;
+    let code = crate::host::compile(SOURCE, "main", "cs_6_0")?;
     // SAFETY: the root signature is inside the shader; plain creations.
     unsafe {
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;

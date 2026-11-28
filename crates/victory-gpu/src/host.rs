@@ -1006,17 +1006,13 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
 }
 "#;
 const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<uint> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
 }
 "#;
 const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<float> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return twin.Load(int4(int2(p.xy), 0, 0));
 }
@@ -1037,6 +1033,67 @@ struct PlanePass {
     step: u32,
     next: AtomicU32,
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
+}
+
+
+/// The depth-plane pass reads one SRV (t0) through a descriptor table.
+fn plane_root_signature(
+    device: &ID3D12Device,
+) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_DESCRIPTOR_RANGE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_ROOT_PARAMETER,
+        D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_SIGNATURE_DESC,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SHADER_VISIBILITY_PIXEL,
+        D3D_ROOT_SIGNATURE_VERSION_1, D3D12SerializeRootSignature,
+    };
+
+    let range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let parameter = D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: &range,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    };
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: 1,
+        pParameters: &parameter,
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let mut serialized: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the descriptor and range remain alive for serialization.
+    unsafe {
+        D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &mut serialized,
+            Some(&mut errors),
+        )?;
+    }
+    let blob = serialized.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: the blob owns the serialized root-signature bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            blob.GetBufferPointer().cast::<u8>(),
+            blob.GetBufferSize(),
+        )
+    };
+    unsafe { device.CreateRootSignature(0, bytes) }
 }
 
 /// The pass's root signature and pipeline for one kind of twin and one
@@ -1077,52 +1134,14 @@ fn plane_pass() -> Option<&'static PlanePass> {
     .as_ref()
 }
 
-/// Compiles function `entry` of `source` for `target` with the system's
-/// compiler, as the indirect-argument clamp is (`crate::indirect`).
+/// Compile an internal HLSL shader with the same DXC runtime used by the
+/// indirect clamp. Host-owned shaders use Shader Model 6.0.
 pub(crate) fn compile(
     source: &str,
-    entry: windows::core::PCSTR,
-    target: windows::core::PCSTR,
+    entry: &str,
+    target: &str,
 ) -> windows::core::Result<Vec<u8>> {
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            windows::core::s!("victory"),
-            None,
-            None,
-            entry,
-            target,
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-    };
-    Ok(bytes.to_vec())
+    crate::indirect::compile_hlsl(source, entry, target)
 }
 
 impl PlanePass {
@@ -1150,19 +1169,18 @@ impl PlanePass {
     }
 
     fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
-        use windows::core::s;
         let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+        let vs = compile(PLANE_CORNERS, "corner", "vs_6_0")?;
         let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
-        let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
+        let ps = compile(source, "plane", "ps_6_0")?;
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
-        // description points at live data and never releases its pointer.
+        // SAFETY: the root signature and both DXIL byte vectors stay alive
+        // through pipeline creation.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let root = plane_root_signature(device)?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -8631,6 +8649,7 @@ impl Host {
                     plane,
                     plane_format,
                 );
+                crate::triangle::record(self, list, &back, (width, height, format));
                 let mut barriers = vec![transition(
                     &back,
                     D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -8646,9 +8665,15 @@ impl Host {
                     transition(
                         &back,
                         D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
                     ),
                 ]);
+                crate::triangle::record(self, list, &back, (width, height, format));
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
             }
             let _ = drawn;
             copy.close();
@@ -9430,7 +9455,7 @@ void main() {
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;
         }
-        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        let code = compile(ADD, "main", "cs_6_0").expect("the test's shader");
         // SAFETY: the shader's own root signature; plain creation.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
@@ -9592,7 +9617,7 @@ void main() {
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;
         }
-        let code = compile(TWICE, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        let code = compile(TWICE, "main", "cs_6_0").expect("the test's shader");
         // SAFETY: the shader's own root signature; plain creation.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
